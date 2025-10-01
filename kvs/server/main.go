@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -8,6 +9,7 @@ import (
 	"net/http"
 	"net/rpc"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rstutsman/cs6450-labs/kvs"
@@ -29,121 +31,160 @@ func (s *Stats) Sub(prev *Stats) Stats {
 	return r
 }
 
-type Transaction struct {
-	ClientID uint64
-	TxID     uint64
-	ReadSet  map[string]bool
-	WriteSet map[string]string
+type Operation struct {
+	OpType string // "GET" or "PUT"
+	Key    string
+	Value  string // empty for GET operations
 }
 
-type KeyLock struct {
-	Readers map[uint64]*Transaction // Map of TxID -> Transaction for shared locks
-	Writer  *Transaction            // Exclusive lock holder (nil if no writer)
+// tracks lock holders for a specific "key"
+type LockInfo struct {
+	readHolders map[uint64]bool // Set of transactions holding read locks
+	writeHolder *uint64         // Transaction holding write lock (nil if none)
+}
+
+func NewLockInfo() *LockInfo {
+	return &LockInfo{
+		readHolders: make(map[uint64]bool),
+		writeHolder: nil,
+	}
 }
 
 type KVService struct {
-	sync.Mutex
-	mp           map[string]string                  // Key-value store
-	locks        map[string]*KeyLock                // Per-key lock state
-	transactions map[uint64]*Transaction            // Active transactions by TxID
+	sync.RWMutex          // embedded, KVService "inherits" all methods of sync.RWMutex (even though go has no inheritence feature)
+	mp           sync.Map // map[string]string - actual key-value store
+	locks        sync.Map // map[string]*LockInfo - lock management; 追蹤每個 key 被哪些 transaction 鎖定
+	transactions sync.Map // map[uint64][]Operation - transaction operations	txn id: ops[]
 	stats        Stats
 	prevStats    Stats
 	lastPrint    time.Time
 }
 
 func NewKVService() *KVService {
-	kvs := &KVService{}
-	kvs.mp = make(map[string]string)
-	kvs.locks = make(map[string]*KeyLock)
-	kvs.transactions = make(map[uint64]*Transaction)
+	// Don't need to initialize sync.Map vars because they are available empty map; zero value of RWMutex is also available un-lock state
+	// Stats is consist of uint64 whose zero value is zero
+	kvs := &KVService{} // kvs is a pointer
 	kvs.lastPrint = time.Now()
-	return kvs
+	return kvs // return pointer
 }
 
-func (kv *KVService) getOrCreateTransaction(clientID, txID uint64) *Transaction {
-	if tx, exists := kv.transactions[txID]; exists {
-		return tx
+// acquireReadLock attempts to acquire a read lock for the given transaction on the given key
+func (kv *KVService) acquireReadLock(key string, txid uint64) error {
+	lockInfoVal, _ := kv.locks.LoadOrStore(key, NewLockInfo()) // return value(type: any), loaded(bool)
+	// sync.Map is a generic container (an implementation from before generics were introduced) -> 取出時，編譯器不知道具體類型，只知道是 any
+	lockInfo := lockInfoVal.(*LockInfo) // I know lockInfoVal contains *LockInfo, convert to this type. If assertion failed（wrong type), get panic
+
+	// Check if there's a write lock held by a different transaction
+	if lockInfo.writeHolder != nil && *lockInfo.writeHolder != txid {
+		return errors.New("Cannot acquire Read Lock, key is currently write locked") // returns an error that formats as the given text.
 	}
 
-	tx := &Transaction{
-		ClientID: clientID,
-		TxID:     txID,
-		ReadSet:  make(map[string]bool),
-		WriteSet: make(map[string]string),
+	// If this transaction already holds the write lock, it can also read
+	if lockInfo.writeHolder != nil && *lockInfo.writeHolder == txid {
+		return nil // Already has write lock, which includes read access
 	}
-	kv.transactions[txID] = tx
-	return tx
+
+	// No other transactions on the given key have lock
+	lockInfo.readHolders[txid] = true
+	return nil
 }
 
-func (kv *KVService) tryAcquireReadLock(key string, tx *Transaction) bool {
-	if keyLock, exists := kv.locks[key]; exists {
-		// Check if there's a conflicting writer
-		if keyLock.Writer != nil && keyLock.Writer.TxID != tx.TxID {
-			return false // Writer conflict
-		}
-	} else {
-		// No existing lock for this key
-		kv.locks[key] = &KeyLock{
-			Readers: make(map[uint64]*Transaction),
-			Writer:  nil,
-		}
+// acquireWriteLock attempts to acquire a write lock for the given transaction on the given key
+func (kv *KVService) acquireWriteLock(key string, txid uint64) error {
+	lockInfoVal, _ := kv.locks.LoadOrStore(key, NewLockInfo())
+	lockInfo := lockInfoVal.(*LockInfo)
+
+	// If this transaction already holds the write lock, allow it
+	if lockInfo.writeHolder != nil && *lockInfo.writeHolder == txid {
+		return nil
 	}
 
-	// Add this transaction as a reader
-	kv.locks[key].Readers[tx.TxID] = tx
-	return true
+	// If another transaction holds the write lock, deny
+	if lockInfo.writeHolder != nil {
+		return errors.New("Cannot acquire Write Lock, key is currently write locked")
+	}
+
+	// If there are read locks held by other transactions, deny
+	// Exception: if only this transaction holds a read lock, allow upgrade
+	if len(lockInfo.readHolders) > 1 {
+		return errors.New("Cannot acquire Write Lock, key has multiple read locks")
+	}
+	if len(lockInfo.readHolders) == 1 && !lockInfo.readHolders[txid] {
+		return errors.New("Cannot acquire Write Lock, key is read locked by another transaction")
+	}
+
+	// Acquire write lock
+	lockInfo.writeHolder = &txid
+	// Remove from read holders if it was there (lock upgrade case)
+	delete(lockInfo.readHolders, txid)
+
+	return nil
 }
 
-func (kv *KVService) tryAcquireWriteLock(key string, tx *Transaction) bool {
-	if keyLock, exists := kv.locks[key]; exists {
-		// Check for any conflicting readers or writers
-		if keyLock.Writer != nil && keyLock.Writer.TxID != tx.TxID {
-			return false // Writer conflict
-		}
-		for readerTxID := range keyLock.Readers {
-			if readerTxID != tx.TxID {
-				return false // Reader conflict
+func (kv *KVService) releaseLocks(txid uint64) {
+	// Get all operations for this transaction to find which keys to unlock
+	if ops, found := kv.transactions.Load(txid); found { // return interface
+		if operations, ok := ops.([]Operation); ok { // convert ops to []Operations
+			for _, op := range operations {
+				if lockInfoVal, found := kv.locks.Load(op.Key); found { // return interface
+					lockInfo := lockInfoVal.(*LockInfo) // convert lockInfoVal to *LockInfo
+
+					// remove share locks associated with the txid
+					delete(lockInfo.readHolders, txid) // func delete(m map[Type]Type1, key Type)
+
+					// remove exclusive lock
+					if lockInfo.writeHolder != nil && *lockInfo.writeHolder == txid {
+						lockInfo.writeHolder = nil
+					}
+				}
 			}
 		}
-	} else {
-		// No existing lock for this key
-		kv.locks[key] = &KeyLock{
-			Readers: make(map[uint64]*Transaction),
-			Writer:  nil,
-		}
 	}
 
-	// Acquire exclusive write lock
-	kv.locks[key].Writer = tx
-	return true
+	// Purposes:
+	// 	1. Prevent memory leaks
+	// 	2. Maintain data consistency
+	// When should we call releaseLocks():
+	//	a. Commit
+	//	b. Abort
+	//	c. Encountering errors during Get/Put
+	// In these situations, we all need to clean txid from transactions map
+	kv.transactions.Delete(txid)
 }
 
 func (kv *KVService) Get(request *kvs.GetRequest, response *kvs.GetResponse) error {
 	kv.Lock()
 	defer kv.Unlock()
 
-	kv.stats.gets++
-
-	// Get or create transaction
-	tx := kv.getOrCreateTransaction(request.ClientID, request.Txid)
-
-	// Try to acquire read lock
-	if !kv.tryAcquireReadLock(request.Key, tx) {
-		response.Success = false
-		return nil
+	if _, found := kv.transactions.Load(request.Txid); !found {
+		kv.transactions.Store(request.Txid, make([]Operation, 0, 4))
 	}
 
-	// Add to read set
-	tx.ReadSet[request.Key] = true
-
-	// Check if key is in transaction's write set first
-	if value, found := tx.WriteSet[request.Key]; found {
-		response.Value = value
-	} else if value, found := kv.mp[request.Key]; found {
-		response.Value = value
+	err := kv.acquireReadLock(request.Key, request.Txid)
+	if err != nil { // acquireReadLock return error only if another transaction holds "write lock"
+		kv.releaseLocks(request.Txid)         // realease ALL locks associated with this txn since we are gonna abort
+		atomic.AddUint64(&kv.stats.aborts, 1) // aborts++
+		return err
 	}
 
-	response.Success = true
+	// Add operation to transaction log. These ops must be atomic!
+	ops, _ := kv.transactions.Load(request.Txid)
+	operations := ops.([]Operation)
+	operations = append(operations, Operation{
+		OpType: "GET",
+		Key:    request.Key,
+	})
+	kv.transactions.Store(request.Txid, operations)
+	// Above ops must be atomic!
+
+	// Read the value from up right away
+	if value, found := kv.mp.Load(request.Key); found {
+		response.Value = value.(string)
+	} else { // Key doesn't exist
+		response.Value = ""
+	}
+
+	atomic.AddUint64(&kv.stats.gets, 1)
 	return nil
 }
 
@@ -151,43 +192,86 @@ func (kv *KVService) Put(request *kvs.PutRequest, response *kvs.PutResponse) err
 	kv.Lock()
 	defer kv.Unlock()
 
-	kv.stats.puts++
-
-	// Get or create transaction
-	tx := kv.getOrCreateTransaction(request.ClientID, request.Txid)
-
-	// Try to acquire write lock
-	if !kv.tryAcquireWriteLock(request.Key, tx) {
-		response.Success = false
-		return nil
+	if _, found := kv.transactions.Load(request.Txid); !found {
+		kv.transactions.Store(request.Txid, make([]Operation, 0, 4))
 	}
 
-	// Add to write set (don't modify main store until commit)
-	tx.WriteSet[request.Key] = request.Value
+	err := kv.acquireWriteLock(request.Key, request.Txid)
+	if err != nil {
+		kv.releaseLocks(request.Txid)
+		atomic.AddUint64(&kv.stats.aborts, 1)
+		return err
+	}
 
-	response.Success = true
+	// Add operation to transaction log (buffered, will be applied on commit)
+	ops, _ := kv.transactions.Load(request.Txid)
+	operations := ops.([]Operation)
+	operations = append(operations, Operation{
+		OpType: "PUT",
+		Key:    request.Key,
+		Value:  request.Value,
+	}) // No modification on mp yet
+	kv.transactions.Store(request.Txid, operations)
+
+	atomic.AddUint64(&kv.stats.puts, 1)
+	return nil
+}
+
+// Commit applies all PUT operations from the transaction, then releases locks
+func (kv *KVService) Commit(request *kvs.CommitRequest, response *kvs.CommitResponse) error {
+	kv.Lock()
+	defer kv.Unlock()
+
+	if operations, found := kv.transactions.Load(request.Txid); found {
+		if ops, ok := operations.([]Operation); ok {
+			// Apply all PUT operations
+			for _, op := range ops {
+				if op.OpType == "PUT" {
+					kv.mp.Store(op.Key, op.Value)
+				}
+			}
+
+			// Only count commits for the lead participant to avoid double counting
+			if request.Lead {
+				atomic.AddUint64(&kv.stats.commits, 1)
+			}
+		}
+	}
+
+	// Release all locks held by this transaction
+	kv.releaseLocks(request.Txid)
+	return nil
+}
+
+// Abort discards all operations and releases locks
+func (kv *KVService) Abort(request *kvs.AbortRequest, response *kvs.AbortResponse) error {
+	kv.Lock()
+	defer kv.Unlock()
+
+	kv.releaseLocks(request.Txid)
+	atomic.AddUint64(&kv.stats.aborts, 1)
 	return nil
 }
 
 func (kv *KVService) printStats() {
-	kv.Lock()
+	kv.RLock()
 	stats := kv.stats
 	prevStats := kv.prevStats
 	kv.prevStats = stats
 	now := time.Now()
 	lastPrint := kv.lastPrint
 	kv.lastPrint = now
-	kv.Unlock()
+	kv.RUnlock()
 
 	diff := stats.Sub(&prevStats)
 	deltaS := now.Sub(lastPrint).Seconds()
 
-	fmt.Printf("get/s %0.2f\nput/s %0.2f\ncommit/s %0.2f\nabort/s %0.2f\nops/s %0.2f\n\n",
+	fmt.Printf("get/s %0.2f\nput/s %0.2f\nops/s %0.2f\ncommit/s %0.2f\nabort/s %0.2f\n\n",
 		float64(diff.gets)/deltaS,
 		float64(diff.puts)/deltaS,
+		float64(diff.gets+diff.puts)/deltaS,
 		float64(diff.commits)/deltaS,
-		float64(diff.aborts)/deltaS,
-		float64(diff.gets+diff.puts)/deltaS)
+		float64(diff.aborts)/deltaS)
 }
 
 func main() {

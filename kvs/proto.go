@@ -1,39 +1,33 @@
 package kvs
 
 type PutRequest struct {
-	Key      string
-	Value    string
-	ClientID uint64
-	Txid     uint64
+	Key   string
+	Value string
+	Txid  uint64
 }
 
 type PutResponse struct {
-	Success bool // false if lock acquisition failed
 }
 
 type GetRequest struct {
-	Key      string
-	ClientID uint64
-	Txid     uint64
+	Key  string
+	Txid uint64
 }
 
 type GetResponse struct {
-	Value   string
-	Success bool // false if lock acquisition failed
+	Value string
 }
 
 type CommitRequest struct {
-	ClientID uint64
-	Txid     uint64
+	Txid uint64
+	Lead bool
 }
 
 type CommitResponse struct {
-	Success bool // false if commit failed
 }
 
 type AbortRequest struct {
-	ClientID uint64
-	Txid     uint64
+	Txid uint64
 }
 
 type AbortResponse struct {
