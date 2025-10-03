@@ -161,7 +161,7 @@ func (kv *KVService) Get(request *kvs.GetRequest, response *kvs.GetResponse) err
 	}
 
 	err := kv.acquireReadLock(request.Key, request.Txid)
-	if err != nil { // acquireReadLock return error only if another transaction holds "write lock"
+	if err != nil { // acquireReadLock return error only if another transaction holds "write lock" (Read-write conflict)
 		kv.releaseLocks(request.Txid)         // realease ALL locks associated with this txn since we are gonna abort
 		atomic.AddUint64(&kv.stats.aborts, 1) // aborts++
 		return err
@@ -197,7 +197,7 @@ func (kv *KVService) Put(request *kvs.PutRequest, response *kvs.PutResponse) err
 	}
 
 	err := kv.acquireWriteLock(request.Key, request.Txid)
-	if err != nil {
+	if err != nil { // Write-write conflict
 		kv.releaseLocks(request.Txid)
 		atomic.AddUint64(&kv.stats.aborts, 1)
 		return err
@@ -210,8 +210,9 @@ func (kv *KVService) Put(request *kvs.PutRequest, response *kvs.PutResponse) err
 		OpType: "PUT",
 		Key:    request.Key,
 		Value:  request.Value,
-	}) // No modification on mp yet
+	})
 	kv.transactions.Store(request.Txid, operations)
+	// No modification on mp yet -> No kv.mp.Store()
 
 	atomic.AddUint64(&kv.stats.puts, 1)
 	return nil
@@ -224,15 +225,13 @@ func (kv *KVService) Commit(request *kvs.CommitRequest, response *kvs.CommitResp
 
 	if operations, found := kv.transactions.Load(request.Txid); found {
 		if ops, ok := operations.([]Operation); ok {
-			// Apply all PUT operations
-			for _, op := range ops {
+			for _, op := range ops { // Apply all PUT operations
 				if op.OpType == "PUT" {
 					kv.mp.Store(op.Key, op.Value)
 				}
 			}
 
-			// Only count commits for the lead participant to avoid double counting
-			if request.Lead {
+			if request.Lead { // Only count commits for the lead participant
 				atomic.AddUint64(&kv.stats.commits, 1)
 			}
 		}
@@ -245,8 +244,8 @@ func (kv *KVService) Commit(request *kvs.CommitRequest, response *kvs.CommitResp
 
 // Abort discards all operations and releases locks
 func (kv *KVService) Abort(request *kvs.AbortRequest, response *kvs.AbortResponse) error {
-	kv.Lock()
-	defer kv.Unlock()
+	// kv.Lock()
+	// defer kv.Unlock()
 
 	kv.releaseLocks(request.Txid)
 	atomic.AddUint64(&kv.stats.aborts, 1)
@@ -254,7 +253,7 @@ func (kv *KVService) Abort(request *kvs.AbortRequest, response *kvs.AbortRespons
 }
 
 func (kv *KVService) printStats() {
-	kv.RLock()
+	kv.RLock() // Read lock
 	stats := kv.stats
 	prevStats := kv.prevStats
 	kv.prevStats = stats
@@ -275,12 +274,30 @@ func (kv *KVService) printStats() {
 }
 
 func main() {
-	port := flag.String("port", "8080", "Port to run the server on")
+	port := flag.String("port", "8080", "Port to run the server on") // return *string(pointer)
 	flag.Parse()
 
 	kvs := NewKVService()
 	rpc.Register(kvs)
+	/* Regester functions with signature: func (t *T) MethodName(args *ArgsType, reply *ReplyType) error
+
+	   So, in this project, this will "register" these methods:
+		KVService.Get(request *kvs.GetRequest, response *kvs.GetResponse) error
+		KVService.Put(request *kvs.PutRequest, response *kvs.PutResponse) error
+		KVService.Commit(request *kvs.CommitRequest, response *kvs.CommitResponse) error
+		KVService.Abort(request *kvs.AbortRequest, response *kvs.AbortResponse) error
+
+		How to call on client?
+		err := client.rpcClient.Call("KVService.Get", &request, &response)
+	                             	 ^^^^^^^^^^^^^^^
+	                                 ServiceName.MethodName
+	*/
 	rpc.HandleHTTP()
+	/*
+		將 RPC 服務註冊到 HTTP 路徑
+		預設路徑：/_goRPC_
+		允許通過 HTTP 傳輸 RPC 請求
+	*/
 
 	l, e := net.Listen("tcp", fmt.Sprintf(":%v", *port))
 	if e != nil {

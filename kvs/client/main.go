@@ -23,12 +23,12 @@ type Client struct {
 }
 
 func Dial(addr string) *Client {
-	rpcClient, err := rpc.DialHTTP("tcp", addr)
+	rpcClient, err := rpc.DialHTTP("tcp", addr) // addr ex: "localhost:8080"
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal(err) // os.Exit(1) called
 	}
 
-	return &Client{rpcClient}
+	return &Client{rpcClient} // wrap rpcClient to our Client struct
 }
 
 func (client *Client) Get(key string, txid uint64) (string, error) {
@@ -53,7 +53,7 @@ func (client *Client) Put(key string, value string, txid uint64) error {
 		Txid:  txid,
 	}
 	response := kvs.PutResponse{}
-	err := client.rpcClient.Call("KVService.Put", &request, &response)
+	err := client.rpcClient.Call("KVService.Put", &request, &response) // only return err (if exists)
 	if err != nil {
 		log.Printf("Error during Client.Put: %v", err)
 		return err
@@ -62,18 +62,19 @@ func (client *Client) Put(key string, value string, txid uint64) error {
 }
 
 type Txn struct {
-	allServers  []*Client
-	usedServers *Set[*Client]
-	id          *uint64
+	allServers  []*Client         // For server := serverFromKey(&key, txn.allServers)
+	usedServers *Set[*Client]     // For notifying all participated server when Commit/Abort
+	id          *uint64           // Zero value is nil i/o 0. Prevent being unable to distinguish between "uninitialized" and "ID is 0"
 	writeSet    map[string]string // Keep write set cache to avoid unnecessary requests
 }
 
 func (txn *Txn) Begin(availableServers []*Client) {
 	txn.allServers = availableServers
-	id := randGen.Uint64()
+	id := randGen.Uint64() // Global: var randGen = rand.New(rand.NewSource(time.Now().UnixNano()))
 	txn.id = &id
-	txn.usedServers = NewSet[*Client]()
+	txn.usedServers = NewSet[*Client]() // // NewSet[T comparable]() -> *Set[T]
 	txn.writeSet = make(map[string]string)
+	// Can be called multiple times, but the transaction will be reset
 }
 
 func (txn *Txn) Commit() error {
@@ -88,13 +89,13 @@ func (txn *Txn) Commit() error {
 			Lead: lead,
 		}
 		lead = false
-		response := kvs.CommitResponse{}
+		response := kvs.CommitResponse{} // empty struct
 		err := server.rpcClient.Call("KVService.Commit", &request, &response)
 		if err != nil {
 			log.Printf("Error during Commit: %v", err)
 		}
 	}
-	return nil
+	return nil // The actual error is only recorded in the logs.
 }
 
 func (txn *Txn) Abort() error {
@@ -127,13 +128,12 @@ func (txn *Txn) Get(key string) (string, error) {
 		return "", errors.New("cannot call Get on a transaction that has not begun")
 	}
 
-	// Check writeSet cache first - use exists check instead of empty string check
 	cachedVal, exists := txn.writeSet[key]
-	if exists {
+	if exists { // Can't use cachedVal != "" because if the Put value is "", it would be mistakenly identified as non-existent
 		return cachedVal, nil
 	}
 
-	resp, err := txn.getServer(key).Get(key, *txn.id)
+	resp, err := txn.getServer(key).Get(key, *txn.id) // txn.getServer(key) -> *Client, then call *Client.Get()
 	if err != nil {
 		// Check if this is a lock conflict (retryable) or real error (fatal)
 		if strings.Contains(err.Error(), "Cannot acquire") || strings.Contains(err.Error(), "Abort:") {
@@ -163,7 +163,7 @@ func (txn *Txn) Put(key string, value string) error {
 		_ = txn.Abort()
 		return fmt.Errorf("server-side error raised: %w", err)
 	}
-	txn.writeSet[key] = value
+	txn.writeSet[key] = value // update "cache"
 	return nil
 }
 
@@ -193,8 +193,8 @@ func runClient(id int, servers []*Client, done *atomic.Bool, workload *kvs.Workl
 	for !done.Load() {
 		retry := 3
 		for retry > 0 {
-			txn := Txn{}
-			txn.Begin(servers)
+			txn := Txn{}       // Separate creation and
+			txn.Begin(servers) // initialization
 			opsCompleted, err = executeTxn(&txn, workload)
 			if err != nil {
 				log.Printf("Error raised during transaction: %v", err)
@@ -210,78 +210,6 @@ func runClient(id int, servers []*Client, done *atomic.Bool, workload *kvs.Workl
 	}
 
 	fmt.Printf("Client %d finished operations.\n", id)
-	resultsCh <- opsCompleted
-}
-
-func runTransferClient(clientId int, servers []*Client, done *atomic.Bool, resultsCh chan<- uint64) {
-	opsCompleted := uint64(0)
-
-	// Initialize accounts if clientId == 0
-	if clientId == 0 {
-		initAccounts(servers)
-		log.Printf("Client %d initialized bank accounts", clientId)
-
-		// Signal that initialization is complete by setting a flag
-		for retry := 0; retry < 10; retry++ {
-			txn := Txn{}
-			txn.Begin(servers)
-			err := txn.Put("init_complete", "true")
-			if err != nil {
-				txn.Abort()
-				time.Sleep(100 * time.Millisecond)
-				continue
-			}
-			err = txn.Commit()
-			if err == nil {
-				break
-			}
-			time.Sleep(100 * time.Millisecond)
-		}
-		log.Printf("Client %d signaled initialization complete", clientId)
-	}
-
-	// All clients wait for initialization to complete
-	for {
-		txn := Txn{}
-		txn.Begin(servers)
-		initFlag, err := txn.Get("init_complete")
-		if err != nil {
-			txn.Abort()
-		} else {
-			err = txn.Commit()
-			if err == nil && initFlag == "true" {
-				log.Printf("Client %d detected initialization complete, starting transfers", clientId)
-				break
-			}
-		}
-		time.Sleep(100 * time.Millisecond) // Wait before checking again
-	}
-
-	transferCount := 0
-	for !done.Load() {
-		// Perform transfer every few iterations
-		if transferCount%5 == 0 {
-			err := performTransfer(clientId, servers)
-			if err != nil {
-				log.Printf("Transfer failed: %v", err)
-			} else {
-				opsCompleted++
-			}
-		}
-
-		// Check balance integrity
-		err := checkTotalBalance(servers)
-		if err != nil {
-			log.Printf("Balance check failed: %v", err)
-		} else {
-			opsCompleted++
-		}
-
-		transferCount++
-		time.Sleep(100 * time.Millisecond) // Slow down to observe behavior
-	}
-
-	fmt.Printf("Transfer client %d finished. Completed %d operations.\n", clientId, opsCompleted)
 	resultsCh <- opsCompleted
 }
 
@@ -506,6 +434,78 @@ func checkTotalBalance(servers []*Client) error {
 	}
 
 	return fmt.Errorf("balance check failed after retries")
+}
+
+func runTransferClient(clientId int, servers []*Client, done *atomic.Bool, resultsCh chan<- uint64) {
+	opsCompleted := uint64(0)
+
+	// Initialize accounts if clientId == 0
+	if clientId == 0 {
+		initAccounts(servers)
+		log.Printf("Client %d initialized bank accounts", clientId)
+
+		// Signal that initialization is complete by setting a flag
+		for retry := 0; retry < 10; retry++ {
+			txn := Txn{}
+			txn.Begin(servers)
+			err := txn.Put("init_complete", "true")
+			if err != nil {
+				txn.Abort()
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+			err = txn.Commit()
+			if err == nil {
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		log.Printf("Client %d signaled initialization complete", clientId)
+	}
+
+	// All clients wait for initialization to complete
+	for {
+		txn := Txn{}
+		txn.Begin(servers)
+		initFlag, err := txn.Get("init_complete")
+		if err != nil {
+			txn.Abort()
+		} else {
+			err = txn.Commit()
+			if err == nil && initFlag == "true" {
+				log.Printf("Client %d detected initialization complete, starting transfers", clientId)
+				break
+			}
+		}
+		time.Sleep(100 * time.Millisecond) // Wait before checking again
+	}
+
+	transferCount := 0
+	for !done.Load() {
+		// Perform transfer every few iterations
+		if transferCount%5 == 0 {
+			err := performTransfer(clientId, servers)
+			if err != nil {
+				log.Printf("Transfer failed: %v", err)
+			} else {
+				opsCompleted++
+			}
+		}
+
+		// Check balance integrity
+		err := checkTotalBalance(servers)
+		if err != nil {
+			log.Printf("Balance check failed: %v", err)
+		} else {
+			opsCompleted++
+		}
+
+		transferCount++
+		time.Sleep(100 * time.Millisecond) // Slow down to observe behavior
+	}
+
+	fmt.Printf("Transfer client %d finished. Completed %d operations.\n", clientId, opsCompleted)
+	resultsCh <- opsCompleted
 }
 
 type HostList []string

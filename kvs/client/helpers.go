@@ -2,7 +2,7 @@ package main
 
 import "hash/fnv"
 
-func dialHosts(servers HostList) []*Client {
+func dialHosts(servers HostList) []*Client { // HostList is []string, convert it to []*Client
 	var clients []*Client
 	for _, addr := range servers {
 		clients = append(clients, Dial(addr))
